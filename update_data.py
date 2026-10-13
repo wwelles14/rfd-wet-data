@@ -401,14 +401,18 @@ def update_lake():
 
 
 def main():
-    ok = True
-    for job in (update_cdec, update_normals, update_daily, update_travel, update_lake):
+    # One flaky source (CDEC often drops connections) must not throw away the others' updates:
+    # succeed if anything worked, so the workflow still commits; fail only if every job failed.
+    done = 0
+    jobs = (update_cdec, update_normals, update_daily, update_travel, update_lake)
+    for job in jobs:
         try:
             job()
+            done += 1
         except Exception as e:  # noqa: BLE001
-            ok = False
             log(f"{job.__name__} failed: {e}")
-    return 0 if ok else 1
+            print(f"::warning::{job.__name__} failed: {e}")
+    return 0 if done else 1
 
 
 if __name__ == "__main__":
