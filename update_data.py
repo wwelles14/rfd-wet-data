@@ -400,11 +400,151 @@ def update_lake():
     log(f"lake: {len(best)} days, last {best[-1]}")
 
 
+# ------------------------------------------------------------------ extras (added for app v3.12.2)
+# Martis Creek Lake (Army Corps flood-control dam above Farad) and the Federal Watermaster's daily report.
+# Self-contained; a failure here only skips these two files.
+def _x_get(url):
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "RFD WET data job"}), timeout=60) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def _x_ms(dt):
+    return int(dt.timestamp() * 1000)
+
+
+def _x_old(name):
+    try:
+        with open(os.path.join(ROOT, name), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _x_save(name, obj):
+    os.makedirs(ROOT, exist_ok=True)
+    new = json.dumps(obj, separators=(",", ":"), sort_keys=True)
+    try:
+        with open(os.path.join(ROOT, name), encoding="utf-8") as f:
+            if f.read() == new:
+                return
+    except OSError:
+        pass
+    with open(os.path.join(ROOT, name), "w", encoding="utf-8") as f:
+        f.write(new)
+    log(f"wrote {name}")
+
+
+MARTIS_BBOX = "-120.16,39.30,-120.04,39.37"     # Martis Creek from the dam down to the Truckee
+
+
+def update_martis():
+    """Release below Martis Creek Dam (the active USGS flow gauge on Martis Creek, looked up by location)
+    and storage from CDEC if a Martis station reports it; last 8 days, hourly."""
+    old = _x_old("martis.json")
+    meta = old.get("meta", {})
+    site, name = meta.get("site"), meta.get("name")
+    if not site or time.time() - meta.get("found", 0) > 7 * 86400:
+        q = urllib.parse.urlencode({"format": "rdb", "bBox": MARTIS_BBOX, "parameterCd": "00060", "siteStatus": "active", "siteType": "ST", "hasDataTypeCd": "iv"})
+        rows = [l.split("\t") for l in _x_get("https://waterservices.usgs.gov/nwis/site/?" + q).splitlines() if l and not l.startswith("#")]
+        hdr, rows = (rows[0], rows[2:]) if len(rows) > 2 else ([], [])
+        cand = [dict(zip(hdr, r)) for r in rows]
+        cand = [c for c in cand if c.get("station_nm", "").upper().startswith("MARTIS")]   # on Martis Creek itself
+        log(f"martis: USGS candidates {[(c.get('site_no'), c.get('station_nm')) for c in cand]}")
+        if cand:
+            site, name = cand[0]["site_no"], cand[0]["station_nm"]
+            meta["found"] = time.time()
+    out = {"meta": {**meta, "site": site, "name": name}, "flow": [], "storage": []}
+    if site:
+        q = urllib.parse.urlencode({"format": "json", "sites": site, "parameterCd": "00060", "period": "P8D", "siteStatus": "all"})
+        j = json.loads(_x_get("https://waterservices.usgs.gov/nwis/iv/?" + q))
+        hourly = {}
+        for ts in j.get("value", {}).get("timeSeries", []):
+            for blk in ts.get("values", []):
+                for v in blk.get("value", []):
+                    try:
+                        x = float(v["value"])
+                    except (TypeError, ValueError):
+                        continue
+                    if x > -999:
+                        t = _x_ms(datetime.fromisoformat(v["dateTime"]))
+                        hourly[t // 3600000] = [t, x]
+        out["flow"] = [hourly[k] for k in sorted(hourly)]
+    sid = meta.get("cdec")
+    if not sid or time.time() - meta.get("cdec_found", 0) > 7 * 86400:
+        sid = None
+        for c in ("MRT", "MCL", "MTS", "MRC", "MTC"):
+            try:
+                page = _x_get("https://cdec.water.ca.gov/dynamicapp/staMeta?station_id=" + c)
+            except Exception:  # noqa: BLE001
+                continue
+            if re.search(r"MARTIS", page, re.I) and re.search(r"STORAGE", page, re.I):
+                sid = c
+                break
+        out["meta"]["cdec"] = sid
+        out["meta"]["cdec_found"] = time.time()
+        log(f"martis: CDEC station {sid}")
+    if sid:
+        today = datetime.now(PST).date()
+        for dur in ("H", "D"):
+            q = urllib.parse.urlencode({"Stations": sid, "SensorNums": "15", "dur_code": dur, "Start": (today - timedelta(days=8)).isoformat(), "End": (today + timedelta(days=1)).isoformat()})
+            pts = []
+            for r in json.loads(_x_get("https://cdec.water.ca.gov/dynamicapp/req/JSONDataServlet?" + q) or "[]") or []:
+                v = r.get("value")
+                if isinstance(v, (int, float)) and v != -9999:
+                    try:
+                        pts.append([_x_ms(datetime.strptime(str(r.get("date")), "%Y-%m-%d %H:%M").replace(tzinfo=PST)), v])
+                    except ValueError:
+                        pass
+            if pts:
+                out["storage"] = sorted(pts)
+                break
+    log(f"martis: site {site} {len(out['flow'])} pts, storage {len(out['storage'])} pts")
+    _x_save("martis.json", out)
+
+
+WM_URL = "https://www.troa.net/reports/dwmr/"
+WM_RES = ["TAHOE", "BOCA", "STAMPEDE", "PROSSER", "DONNER", "INDEPENDENCE", "MARTIS"]
+
+
+def update_wm():
+    """The daily report's remarks (the Watermaster's own reason for a change), its date, and the computed
+    inflow to each reservoir. Read leniently: anything not found is left out."""
+    html = _x_get(WM_URL)
+    txt = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
+    txt = re.sub(r"<br\s*/?>|</(p|div|tr|td|th|li|h\d)>", "\n", txt, flags=re.I)
+    txt = re.sub(r"<[^>]+>", " ", txt).replace("&nbsp;", " ").replace("&amp;", "&")
+    txt = re.sub(r"[ \t]+", " ", txt)
+    txt = "\n".join(l.strip() for l in txt.splitlines() if l.strip())
+    out = {"meta": {"url": WM_URL}, "available": False}
+    if re.search(r"not available", txt, re.I) and not re.search(r"REMARKS", txt):
+        log("wm: report not posted")
+        _x_save("wm.json", out)
+        return
+    out["available"] = True
+    m = re.search(r"DATE:?\s*([A-Za-z]{3,9},?\s+[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}[-/][A-Za-z]{3}[-/]\d{4}|\d{1,2}/\d{1,2}/\d{2,4})", txt)
+    out["date"] = m.group(1).strip() if m else None
+    m = re.search(r"REMARKS:?\s*(.*?)(?=\n?(BOCA WEATHER|TAHOE\s+HI|\(I\)|ESTIMATED DATE|$))", txt, re.S | re.I)
+    rem = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+    out["remarks"] = rem[:600] if len(rem) > 3 else ""
+    inflow = {}
+    for r in WM_RES:
+        mm = re.search(rf"\b{r}\b(.{{0,400}}?)COMP\.?\s*INFLOW\D{{0,12}}(-?\d[\d,]*\.?\d*)", txt, re.S)
+        if mm:
+            try:
+                inflow[r.lower()] = float(mm.group(2).replace(",", ""))
+            except ValueError:
+                pass
+    out["inflow"] = inflow
+    out["excerpt"] = txt[:3000]          # kept so the reading can be checked and adjusted
+    log(f"wm: date {out['date']} remarks {out['remarks'][:80]!r} inflow {inflow}")
+    _x_save("wm.json", out)
+
+
 def main():
     # One flaky source (CDEC often drops connections) must not throw away the others' updates:
     # succeed if anything worked, so the workflow still commits; fail only if every job failed.
     done = 0
-    jobs = (update_cdec, update_normals, update_daily, update_travel, update_lake)
+    jobs = (update_cdec, update_normals, update_daily, update_travel, update_lake, update_martis, update_wm)
     for job in jobs:
         try:
             job()
