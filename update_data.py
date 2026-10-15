@@ -483,21 +483,27 @@ def update_martis():
         out["meta"]["cdec"] = sid
         out["meta"]["cdec_found"] = time.time()
         log(f"martis: CDEC station {sid}")
-    if sid:
+    if sid:   # CDEC: 15 storage (ac-ft), 23 outflow = the dam's release (cfs), 76 inflow (cfs); hourly, else daily
         today = datetime.now(PST).date()
         for dur in ("H", "D"):
-            q = urllib.parse.urlencode({"Stations": sid, "SensorNums": "15", "dur_code": dur, "Start": (today - timedelta(days=8)).isoformat(), "End": (today + timedelta(days=1)).isoformat()})
-            pts = []
+            q = urllib.parse.urlencode({"Stations": sid, "SensorNums": "15,23,76", "dur_code": dur, "Start": (today - timedelta(days=8)).isoformat(), "End": (today + timedelta(days=1)).isoformat()})
+            got = {}
             for r in json.loads(_x_get("https://cdec.water.ca.gov/dynamicapp/req/JSONDataServlet?" + q) or "[]") or []:
                 v = r.get("value")
                 if isinstance(v, (int, float)) and v != -9999:
                     try:
-                        pts.append([_x_ms(datetime.strptime(str(r.get("date")), "%Y-%m-%d %H:%M").replace(tzinfo=PST)), v])
+                        got.setdefault(int(r.get("SENSOR_NUM")), []).append([_x_ms(datetime.strptime(str(r.get("date")), "%Y-%m-%d %H:%M").replace(tzinfo=PST)), v])
                     except ValueError:
                         pass
-            if pts:
-                out["storage"] = sorted(pts)
+            if got:
+                out["storage"] = sorted(got.get(15, []))
+                out["inflow"] = sorted(got.get(76, []))
+                if not out["flow"] and got.get(23):          # no USGS gauge below the dam: use the dam's own outflow
+                    out["flow"] = sorted(got[23])
+                    out["meta"]["flow_src"] = f"CDEC {sid} outflow"
                 break
+    if out["flow"] and not out["meta"].get("flow_src"):
+        out["meta"]["flow_src"] = f"USGS {site}"
     log(f"martis: site {site} {len(out['flow'])} pts, storage {len(out['storage'])} pts")
     _x_save("martis.json", out)
 
