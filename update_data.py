@@ -510,39 +510,105 @@ def update_martis():
 
 WM_URL = "https://www.troa.net/reports/dwmr/"
 WM_RES = ["TAHOE", "BOCA", "STAMPEDE", "PROSSER", "DONNER", "INDEPENDENCE", "MARTIS"]
+_NUM = re.compile(r"^-?\d[\d,]*\.?\d*$")
+
+
+def _x_num(s):
+    try:
+        return float(s.replace(",", ""))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _wm_parse(lines):
+    """Pull the useful numbers out of the report's text, one value per line (the page's table cells).
+    Reservoirs: storage today/yesterday and its change (ac-ft), the release logged (cfs), the change in that
+    release and when, the 24-h average release, computed inflow. Farad: latest flow and 24-hour average."""
+    out = {"res": {}, "farad": None, "remarks": "", "time": None}
+    starts = []
+    for i, l in enumerate(lines):
+        if l in WM_RES and i + 1 < len(lines) and re.match(r"^\d{1,2}:\d{2} [AP]M$", lines[i + 1]):
+            starts.append((i, l))
+    stops = [i for i, l in enumerate(lines) if l in ("LAHONTAN", "REMARKS:") or l.startswith("REMARKS")]
+    for n, (i, name) in enumerate(starts):
+        end = starts[n + 1][0] if n + 1 < len(starts) else min([s for s in stops if s > i] or [len(lines)])
+        blk = lines[i:end]
+        r = {"time": lines[i + 1]}
+        def after(label, k=1):
+            for j, l in enumerate(blk):
+                if l == label and j + k < len(blk):
+                    v = _x_num(blk[j + k])
+                    if v is not None:
+                        return v
+            return None
+        r["storage"] = after("TODAY")
+        r["prev"] = after("YESTERDAY") if after("YESTERDAY") is not None else after("PREVIOUS")
+        r["change_af"] = after("CHANGE")
+        for j, l in enumerate(blk):
+            if l.startswith("COMP. INFLOW") and j + 1 < len(blk):
+                r["inflow"] = _x_num(blk[j + 1])
+        for j, l in enumerate(blk):          # release row: "10/15 04:00" then pipes/spillway/total/change/avg
+            if re.match(r"^\d{1,2}/\d{1,2} \d{1,2}:\d{2}$", l):
+                nums = []
+                for x in blk[j + 1:j + 8]:
+                    v = _x_num(x) if _NUM.match(x) else None
+                    if v is None:
+                        break
+                    nums.append(v)
+                if len(nums) >= 3:
+                    r.update({"at": l, "release": nums[-3], "rel_change": nums[-2], "rel_avg": nums[-1]})
+                break
+        out["res"][name.lower()] = r
+    # Farad: "FARAD / FLOW (CFS) / ... GH / 3.95 / 06:30 / 396 / ... 24-hr AVG: / 386"
+    for i, l in enumerate(lines):
+        if l == "FARAD" and i + 1 < len(lines) and lines[i + 1].startswith("FLOW"):
+            f = {}
+            for j in range(i, min(i + 40, len(lines))):
+                if lines[j] == "GH" and j + 3 < len(lines) and re.match(r"^\d{1,2}:\d{2}$", lines[j + 2]) and "flow" not in f:
+                    f["flow"], f["time"] = _x_num(lines[j + 3]), lines[j + 2]
+                if lines[j] == "24-hr AVG:" and j + 1 < len(lines) and "avg" not in f:
+                    f["avg"] = _x_num(lines[j + 1])
+            out["farad"] = f or None
+            break
+    # Remarks: only real words after "REMARKS:", stopping at the next table label
+    for i, l in enumerate(lines):
+        if l.startswith("REMARKS"):
+            words = [l.split(":", 1)[1] if ":" in l else ""]
+            for x in lines[i + 1:i + 30]:
+                if x in ("Note", "DIFF", "GH", "BOCA", "TAHOE") or x.endswith("FLOW (CFS)") or x.startswith("BOCA WEATHER"):
+                    break
+                words.append(x)
+            t = re.sub(r"[^\x20-\x7E]", " ", " ".join(words))
+            t = re.sub(r"\s+", " ", t).strip()
+            out["remarks"] = t[:600] if len(re.findall(r"[A-Za-z]", t)) >= 6 else ""
+            break
+    return out
 
 
 def update_wm():
-    """The daily report's remarks (the Watermaster's own reason for a change), its date, and the computed
-    inflow to each reservoir. Read leniently: anything not found is left out."""
+    """The Federal Watermaster's daily worksheet (troa.net), read cell by cell: each reservoir's storage and
+    overnight change, the release logged and any change to it (with the time), computed inflow, Farad's latest
+    flow and 24-hour average, and the remarks line when it has real words. Anything not found is left out."""
     html = _x_get(WM_URL)
     txt = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.S | re.I)
     txt = re.sub(r"<br\s*/?>|</(p|div|tr|td|th|li|h\d)>", "\n", txt, flags=re.I)
     txt = re.sub(r"<[^>]+>", " ", txt).replace("&nbsp;", " ").replace("&amp;", "&")
     txt = re.sub(r"[ \t]+", " ", txt)
-    txt = "\n".join(l.strip() for l in txt.splitlines() if l.strip())
+    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+    txt = "\n".join(lines)
     out = {"meta": {"url": WM_URL}, "available": False}
     if re.search(r"not available", txt, re.I) and not re.search(r"REMARKS", txt):
         log("wm: report not posted")
         _x_save("wm.json", out)
         return
     out["available"] = True
-    m = re.search(r"DATE:?\s*([A-Za-z]{3,9},?\s+[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}[-/][A-Za-z]{3}[-/]\d{4}|\d{1,2}/\d{1,2}/\d{2,4})", txt)
+    m = re.search(r"DATE:?\s*([A-Za-z]{3,9},?\s+[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})", txt)
     out["date"] = m.group(1).strip() if m else None
-    m = re.search(r"REMARKS:?\s*(.*?)(?=\n?(BOCA WEATHER|TAHOE\s+HI|\(I\)|ESTIMATED DATE|$))", txt, re.S | re.I)
-    rem = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
-    out["remarks"] = rem[:600] if len(rem) > 3 else ""
-    inflow = {}
-    for r in WM_RES:
-        mm = re.search(rf"\b{r}\b(.{{0,400}}?)COMP\.?\s*INFLOW\D{{0,12}}(-?\d[\d,]*\.?\d*)", txt, re.S)
-        if mm:
-            try:
-                inflow[r.lower()] = float(mm.group(2).replace(",", ""))
-            except ValueError:
-                pass
-    out["inflow"] = inflow
-    out["excerpt"] = txt[:3000]          # kept so the reading can be checked and adjusted
-    log(f"wm: date {out['date']} remarks {out['remarks'][:80]!r} inflow {inflow}")
+    p = _wm_parse(lines)
+    out.update({"res": p["res"], "farad": p["farad"], "remarks": p["remarks"]})
+    out["inflow"] = {k: r["inflow"] for k, r in p["res"].items() if r.get("inflow") is not None}
+    out["excerpt"] = txt[:9000]          # kept so the reading can be checked and adjusted
+    log(f"wm: date {out['date']} farad {p['farad']} remarks {p['remarks'][:80]!r} res {len(p['res'])}")
     _x_save("wm.json", out)
 
 
